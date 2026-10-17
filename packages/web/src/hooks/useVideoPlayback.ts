@@ -1,4 +1,4 @@
-import { useRef, useEffect, useCallback, useMemo } from 'react';
+import { useRef, useEffect, useCallback, useMemo, useState } from 'react';
 import type { VideoSegment, Timeline } from '@proj/shared';
 
 interface UseVideoPlaybackParams {
@@ -14,6 +14,45 @@ interface UseVideoPlaybackParams {
 interface UseVideoPlaybackResult {
   timelineToSource: (timelinePos: number) => number;
   currentSpeedRate: number;
+  isLoading: boolean;
+  error: string | null;
+  setLoading: (loading: boolean) => void;
+  setError: (error: string | null) => void;
+}
+
+function seekVideo(video: HTMLVideoElement, targetTime: number): Promise<void> {
+  if (!video.seeking && Math.abs(video.currentTime - targetTime) <= 0.05) {
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      video.removeEventListener('seeked', handleSeeked);
+      video.removeEventListener('error', handleError);
+    };
+    const handleSeeked = () => {
+      cleanup();
+      resolve();
+    };
+    const handleError = () => {
+      cleanup();
+      reject(new Error('The video failed while seeking.'));
+    };
+
+    video.addEventListener('seeked', handleSeeked, { once: true });
+    video.addEventListener('error', handleError, { once: true });
+
+    try {
+      video.currentTime = targetTime;
+      if (!video.seeking && Math.abs(video.currentTime - targetTime) <= 0.05) {
+        cleanup();
+        resolve();
+      }
+    } catch (error) {
+      cleanup();
+      reject(error instanceof Error ? error : new Error('The video could not seek.'));
+    }
+  });
 }
 
 export function useVideoPlayback({
@@ -25,8 +64,13 @@ export function useVideoPlayback({
   setPlayheadPosition,
   setIsPlaying,
 }: UseVideoPlaybackParams): UseVideoPlaybackResult {
+  const [isLoading, setIsLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const isSeeking = useRef(false);
   const pendingSeekTime = useRef<number | null>(null);
+  const desiredPlaying = useRef(isPlaying);
+  const playbackRequestId = useRef(0);
+  desiredPlaying.current = isPlaying;
 
   const timelineToSource = useCallback((timelinePos: number): number => {
     for (const seg of videoSegments) {
@@ -44,6 +88,8 @@ export function useVideoPlayback({
     pendingSeekTime.current = playheadPosition;
   }, [playheadPosition]);
 
+  // SINK: Playhead Position -> Video Element
+  // Only sync when NOT playing (seeking/scrubbing)
   useEffect(() => {
     const video = videoRef.current;
     if (!video || !timeline) return;
@@ -52,36 +98,47 @@ export function useVideoPlayback({
 
     const sourceTime = timelineToSource(playheadPosition);
     const diff = Math.abs(video.currentTime - sourceTime);
-    if (diff > 0.05) {
+    if (diff > 0.1) {
       isSeeking.current = true;
       video.currentTime = sourceTime;
     }
   }, [playheadPosition, isPlaying, timeline, timelineToSource, videoRef]);
 
+  // SOURCE: Play/Pause trigger -> Video Element
   useEffect(() => {
     const video = videoRef.current;
     if (!video || !timeline) return;
 
-    if (isPlaying && video.paused) {
-      const timelinePos = pendingSeekTime.current ?? 0;
-      const sourceTime = timelineToSource(timelinePos);
+    if (isPlaying) {
+      if (!video.paused || isSeeking.current) return;
 
-      const handleSeekedOnce = () => {
-        video.removeEventListener('seeked', handleSeekedOnce);
-        video.play().catch(() => {});
+      const requestId = ++playbackRequestId.current;
+      const sourceTime = timelineToSource(playheadPosition);
+      const startPlayback = async () => {
+        try {
+          if (Math.abs(video.currentTime - sourceTime) > 0.1) {
+            isSeeking.current = true;
+            await seekVideo(video, sourceTime);
+            isSeeking.current = false;
+          }
+
+          if (playbackRequestId.current !== requestId || !desiredPlaying.current) return;
+          await video.play();
+        } catch (err) {
+          isSeeking.current = false;
+          if (playbackRequestId.current !== requestId) return;
+          console.error('Playback failed:', err);
+          setError(err instanceof Error ? err.message : 'The video could not start playing.');
+          setIsPlaying(false);
+        }
       };
 
-      const diff = Math.abs(video.currentTime - sourceTime);
-      if (diff > 0.1) {
-        video.addEventListener('seeked', handleSeekedOnce);
-        video.currentTime = sourceTime;
-      } else {
-        video.play().catch(() => {});
-      }
-    } else if (!isPlaying && !video.paused) {
+      void startPlayback();
+    } else {
+      playbackRequestId.current += 1;
       video.pause();
     }
-  }, [isPlaying, timeline, timelineToSource, videoRef]);
+  }, [isPlaying, playheadPosition, setError, setIsPlaying, timeline, timelineToSource, videoRef]);
 
   const findSegmentAtTimeline = useCallback((timelinePos: number): VideoSegment | null => {
     for (const seg of videoSegments) {
@@ -125,9 +182,7 @@ export function useVideoPlayback({
           const timelinePos = foundSegment.startTime + (relativeSource / speedRate);
           setPlayheadPosition(timelinePos);
         } else {
-          // Source time is not in any segment (gap from deleted segment)
           const sortedBySource = [...videoSegments].sort((a, b) => a.sourceStart - b.sourceStart);
-
           let nextSeg: VideoSegment | null = null;
           let prevSeg: VideoSegment | null = null;
 
@@ -165,7 +220,19 @@ export function useVideoPlayback({
           isSeeking.current = true;
           video.currentTime = nextSeg.sourceStart;
           setPlayheadPosition(nextSeg.startTime);
-          video.play().catch(() => {});
+          const continuePlayback = async () => {
+            try {
+              await seekVideo(video, nextSeg.sourceStart);
+              isSeeking.current = false;
+              await video.play();
+            } catch (err) {
+              isSeeking.current = false;
+              console.error('Playback failed while advancing to the next segment:', err);
+              setError(err instanceof Error ? err.message : 'The next segment could not start playing.');
+              setIsPlaying(false);
+            }
+          };
+          void continuePlayback();
           return;
         }
       }
@@ -177,16 +244,35 @@ export function useVideoPlayback({
       isSeeking.current = false;
     };
 
+    const handlePlaying = () => {
+      if (desiredPlaying.current) setIsPlaying(true);
+    };
+
+    const handlePause = () => {
+      setIsPlaying(false);
+    };
+
+    const handleMediaError = () => {
+      isSeeking.current = false;
+      setIsPlaying(false);
+    };
+
     video.addEventListener('timeupdate', handleTimeUpdate);
     video.addEventListener('ended', handleEnded);
     video.addEventListener('seeked', handleSeeked);
+    video.addEventListener('playing', handlePlaying);
+    video.addEventListener('pause', handlePause);
+    video.addEventListener('error', handleMediaError);
 
     return () => {
       video.removeEventListener('timeupdate', handleTimeUpdate);
       video.removeEventListener('ended', handleEnded);
       video.removeEventListener('seeked', handleSeeked);
+      video.removeEventListener('playing', handlePlaying);
+      video.removeEventListener('pause', handlePause);
+      video.removeEventListener('error', handleMediaError);
     };
-  }, [setPlayheadPosition, setIsPlaying, videoSegments, findSegmentAtTimeline, findNextSegment, videoRef]);
+  }, [setError, setPlayheadPosition, setIsPlaying, videoSegments, findSegmentAtTimeline, findNextSegment, videoRef]);
 
   const currentVideoSegment = useMemo(() => {
     return videoSegments.find(seg => {
@@ -213,5 +299,9 @@ export function useVideoPlayback({
   return {
     timelineToSource,
     currentSpeedRate,
+    isLoading,
+    error,
+    setLoading: setIsLoading,
+    setError: setError,
   };
 }

@@ -70,6 +70,7 @@ export async function extractMetadata(filePath: string): Promise<VideoMetadata> 
     fps,
     codec: videoStream.codec_name,
     bitrate: parseInt(result.format.bit_rate, 10) || 0,
+    hasAudio: result.streams.some((stream: any) => stream.codec_type === 'audio'),
   };
 }
 
@@ -160,6 +161,7 @@ export async function processUpload(
     fps: metadata.fps,
     codec: metadata.codec,
     bitrate: metadata.bitrate,
+    hasAudio: metadata.hasAudio,
     thumbnails,
   };
 }

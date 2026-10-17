@@ -22,6 +22,7 @@ function App() {
     history,
     loadProjectFromServer,
     migrateAndSave,
+    updateSource,
   } = useTimelineStore();
   const [isUploading, setIsUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
@@ -45,6 +46,47 @@ function App() {
     };
     init();
   }, [loadFromStorage, migrateAndSave]);
+
+  // Upload processing generates the source waveform asynchronously. Fetch it
+  // while the job is running so the embedded-audio lane can display it.
+  useEffect(() => {
+    const source = project?.source;
+    if (!source?.hasAudio || source.waveform !== undefined) return;
+
+    let active = true;
+    let polling = false;
+    let interval: ReturnType<typeof setInterval>;
+
+    const pollStatus = async () => {
+      if (polling || !active) return;
+      polling = true;
+      try {
+        const response = await fetch(`/api/source/${encodeURIComponent(source.id)}/status`);
+        if (!response.ok) throw new Error(`Source status request failed (${response.status})`);
+        const status = await response.json();
+
+        if (!active) return;
+        if (status.status === 'done' && status.result) {
+          updateSource(status.result);
+          clearInterval(interval);
+        } else if (status.status !== 'processing') {
+          clearInterval(interval);
+        }
+      } catch (error) {
+        console.warn('Could not load source waveform:', error);
+        clearInterval(interval);
+      } finally {
+        polling = false;
+      }
+    };
+
+    void pollStatus();
+    interval = setInterval(() => void pollStatus(), 750);
+    return () => {
+      active = false;
+      clearInterval(interval);
+    };
+  }, [project?.source.id, project?.source.hasAudio, project?.source.waveform, updateSource]);
 
   const handleProjectSelect = useCallback(async (id: string) => {
     setIsLoading(true);

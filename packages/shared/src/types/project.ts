@@ -32,6 +32,7 @@ export interface VideoSource {
   fps: number;
   codec: string;
   bitrate: number;
+  hasAudio?: boolean;
   thumbnails?: string[];
   waveform?: number[];
 }
@@ -308,6 +309,7 @@ export interface VideoMetadata {
   fps: number;
   codec: string;
   bitrate: number;
+  hasAudio: boolean;
 }
 
 export interface UploadResponse {

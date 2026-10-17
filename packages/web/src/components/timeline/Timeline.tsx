@@ -1,4 +1,4 @@
-import { useRef, useCallback, useEffect, useState } from 'react';
+import { Fragment, useRef, useCallback, useEffect, useState } from 'react';
 import { useTimelineStore } from '../../stores/timeline';
 import { TimeRuler } from './TimeRuler';
 import type { Segment as SegmentType, VideoSegment, CaptionSegment, ZoomEffectSegment, AudioSegment } from '@proj/shared';
@@ -484,8 +484,8 @@ export function Timeline() {
             const canDrag = track.type !== 'video';
 
             return (
+            <Fragment key={track.id}>
             <div
-              key={track.id}
               className={`flex flex-shrink-0 ${isDraggingThis ? 'opacity-40' : ''}`}
               style={{ height: TRACK_HEIGHT }}
             >
@@ -529,6 +529,60 @@ export function Timeline() {
                 ))}
               </div>
             </div>
+            {track.type === 'video' && project.source.hasAudio && (
+              <div
+                key="embedded-source-audio-track"
+                className="flex flex-shrink-0"
+                style={{ height: TRACK_HEIGHT }}
+              >
+                <div
+                  className="sticky left-0 z-30 bg-terminal-surface flex items-center px-2 border-b border-terminal-border"
+                  style={{ width: LABEL_WIDTH, minWidth: LABEL_WIDTH }}
+                >
+                  <span className={`text-xs font-medium ${TRACK_LABEL_COLOR.audio}`}>
+                    Audio
+                  </span>
+                </div>
+                <div
+                  className="relative border-b border-terminal-border bg-terminal-bg/50"
+                  style={{ width: totalWidth, height: TRACK_HEIGHT }}
+                  aria-label="Embedded source audio, synchronized with video"
+                >
+                  {track.segments.map(segment => {
+                    if (segment.type !== 'video') return null;
+                    const videoSegment = segment as VideoSegment;
+                    return (
+                      <div
+                        key={`source-audio-${segment.id}`}
+                        className="absolute top-1.5 bottom-1.5 overflow-hidden rounded-sm border-l-[3px] border-l-accent-blue bg-accent-blue/10"
+                        style={{
+                          left: segment.startTime * timeline.pixelsPerSecond,
+                          width: Math.max(segment.duration * timeline.pixelsPerSecond, 4),
+                          opacity: videoSegment.effects.audioMuted ? 0.45 : 1,
+                        }}
+                        title="Áudio incorporado ao vídeo"
+                      >
+                        {project.source.waveform && project.source.waveform.length > 0 && (
+                          <WaveformDisplay
+                            peaks={project.source.waveform}
+                            startRatio={videoSegment.sourceStart / project.source.duration}
+                            endRatio={videoSegment.sourceEnd / project.source.duration}
+                            color="#3b82f6"
+                            muted={!!videoSegment.effects.audioMuted}
+                          />
+                        )}
+                        <div className="absolute inset-0 flex items-center justify-center px-3 pointer-events-none">
+                          <span className="text-xs truncate text-terminal-text font-medium">
+                            Embedded audio
+                          </span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+            </Fragment>
             );
           })}
 
@@ -714,7 +768,7 @@ function SegmentBlock({ segment, pixelsPerSecond, isSelected, isDragging, onSele
   let sourceStartRatio = 0;
   let sourceEndRatio = 1;
 
-  if (isVideo && project?.source?.waveform?.length) {
+  if (isVideo && !project?.source?.hasAudio && project?.source?.waveform?.length) {
     waveformPeaks = project.source.waveform;
     waveformMuted = !!(segment as VideoSegment).effects.audioMuted;
     const videoSeg = segment as VideoSegment;

@@ -1,12 +1,13 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
-import { join } from 'path';
+import { extname, join } from 'path';
 import { nanoid } from 'nanoid';
-import type { Project, ExportProgress, UploadResponse, ExportRequest } from '@proj/shared';
+import type { Project, ExportProgress, UploadResponse, ExportRequest, NovelinhaAssembleRequest, NovelinhaAssembleResponse } from '@proj/shared';
 import { processUpload, processOverlayUpload, processAudioUpload, extractFrame, startExport, getExportJob, resolveMediaPath, generateThumbnails, getProcessingStatus } from './services/ffmpeg';
 import { listProjects, getProject, saveProject, deleteProject } from './services/projects';
+import { assembleNovelinha, ValidationError } from './services/novelinha';
 
-const app = new Hono();
+export const app = new Hono();
 const DATA_DIR = join(import.meta.dir, '../../../data');
 
 // Ensure data directories exist on startup
@@ -34,6 +35,21 @@ async function serveFile(filepath: string, contentType: string) {
   return null;
 }
 
+function getVideoContentType(filepath: string): string {
+  switch (extname(filepath).toLowerCase()) {
+    case '.mp4':
+      return 'video/mp4';
+    case '.mov':
+      return 'video/quicktime';
+    case '.webm':
+      return 'video/webm';
+    case '.mkv':
+      return 'video/x-matroska';
+    default:
+      return 'application/octet-stream';
+  }
+}
+
 async function serveVideo(filepath: string, rangeHeader: string | undefined) {
   const file = Bun.file(filepath);
   if (!(await file.exists())) {
@@ -41,6 +57,7 @@ async function serveVideo(filepath: string, rangeHeader: string | undefined) {
   }
 
   const fileSize = file.size;
+  const contentType = getVideoContentType(filepath);
 
   // Handle Range request for video seeking
   if (rangeHeader) {
@@ -52,7 +69,7 @@ async function serveVideo(filepath: string, rangeHeader: string | undefined) {
     return new Response(file.slice(start, end + 1), {
       status: 206,
       headers: {
-        'Content-Type': 'video/mp4',
+        'Content-Type': contentType,
         'Content-Length': String(chunkSize),
         'Content-Range': `bytes ${start}-${end}/${fileSize}`,
         'Accept-Ranges': 'bytes',
@@ -63,7 +80,7 @@ async function serveVideo(filepath: string, rangeHeader: string | undefined) {
   // No Range header - return full file with Accept-Ranges
   return new Response(file.stream(), {
     headers: {
-      'Content-Type': 'video/mp4',
+      'Content-Type': contentType,
       'Content-Length': String(fileSize),
       'Accept-Ranges': 'bytes',
     },
@@ -325,33 +342,55 @@ app.post('/api/export', async (c) => {
   }
 });
 
-const port = parseInt(process.env.PORT || '3001', 10);
-
-// Start server with WebSocket support
-const server = Bun.serve({
-  port,
-  maxRequestBodySize: 1024 * 1024 * 1024, // 1GB
-  fetch: app.fetch,
-  websocket: {
-    open(ws) {
-      const wsData = ws.data as { jobId?: string } | undefined;
-      const jobId = wsData?.jobId;
-      if (jobId) {
-        if (!exportClients.has(jobId)) {
-          exportClients.set(jobId, new Set());
-        }
-        exportClients.get(jobId)!.add(ws as unknown as WebSocket);
-      }
-    },
-    message() {},
-    close(ws) {
-      const wsData = ws.data as { jobId?: string } | undefined;
-      const jobId = wsData?.jobId;
-      if (jobId) {
-        exportClients.get(jobId)?.delete(ws as unknown as WebSocket);
-      }
-    },
-  },
+// Automatic novelinha assembly
+app.post('/api/novelinha/assemble', async (c) => {
+  try {
+    const body = await c.req.json<NovelinhaAssembleRequest>();
+    const result = await assembleNovelinha(body, (jobId, progress) => {
+      broadcastProgress(jobId, progress);
+    });
+    return c.json<NovelinhaAssembleResponse>(result);
+  } catch (error) {
+    if (error instanceof ValidationError) {
+      return c.json<NovelinhaAssembleResponse>({ success: false, error: error.message }, 400);
+    }
+    console.error('Novelinha assembly error:', error);
+    return c.json<NovelinhaAssembleResponse>({
+      success: false,
+      error: error instanceof Error ? error.message : 'Assembly failed',
+    }, 500);
+  }
 });
 
-console.log(`Server running at http://localhost:${port}`);
+if (import.meta.main) {
+  const port = parseInt(process.env.PORT || '3001', 10);
+
+  // Start server with WebSocket support
+  const server = Bun.serve({
+    port,
+    maxRequestBodySize: 1024 * 1024 * 1024, // 1GB
+    fetch: app.fetch,
+    websocket: {
+      open(ws) {
+        const wsData = ws.data as { jobId?: string } | undefined;
+        const jobId = wsData?.jobId;
+        if (jobId) {
+          if (!exportClients.has(jobId)) {
+            exportClients.set(jobId, new Set());
+          }
+          exportClients.get(jobId)!.add(ws as unknown as WebSocket);
+        }
+      },
+      message() {},
+      close(ws) {
+        const wsData = ws.data as { jobId?: string } | undefined;
+        const jobId = wsData?.jobId;
+        if (jobId) {
+          exportClients.get(jobId)?.delete(ws as unknown as WebSocket);
+        }
+      },
+    },
+  });
+
+  console.log(`Server running at http://localhost:${port}`);
+}

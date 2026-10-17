@@ -12,6 +12,37 @@ function getTrackSegments(timeline: Timeline, trackType: string): Segment[] {
   return timeline.tracks.find(t => t.type === trackType)?.segments ?? [];
 }
 
+function mediaPathToUrl(path: string | undefined, id: string, filename: string): string | null {
+  const rawPath = path?.trim();
+
+  if (rawPath) {
+    if (/^(https?:|blob:|data:)/i.test(rawPath)) {
+      return rawPath;
+    }
+
+    const normalizedPath = rawPath.replace(/\\/g, '/');
+    const uploadsIndex = normalizedPath.indexOf('/uploads/');
+    if (uploadsIndex >= 0) {
+      return normalizedPath.slice(uploadsIndex);
+    }
+    if (normalizedPath.startsWith('uploads/')) {
+      return `/${normalizedPath}`;
+    }
+    if (normalizedPath.startsWith('/')) {
+      return normalizedPath;
+    }
+
+    const basename = normalizedPath.split('/').pop();
+    if (basename) {
+      return `/uploads/${basename}`;
+    }
+  }
+
+  // Legacy projects may not have a usable path. Keep the old ID convention as a fallback.
+  const extension = filename.split('.').pop() || 'mp4';
+  return id ? `/uploads/${id}.${extension}` : null;
+}
+
 export function VideoPreview() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -72,7 +103,7 @@ export function VideoPreview() {
   }, [timeline]);
 
   // Video playback synchronization (timeupdate, seeking, speed)
-  useVideoPlayback({
+  const { isLoading, error: videoError, setLoading, setError } = useVideoPlayback({
     videoRef,
     videoSegments,
     timeline,
@@ -113,7 +144,18 @@ export function VideoPreview() {
   // Handle video loaded
   const handleLoadedMetadata = useCallback(() => {
     updateVideoBounds();
-  }, [updateVideoBounds]);
+    setLoading(false);
+    setError(null);
+  }, [setError, setLoading, updateVideoBounds]);
+
+  const handleLoadStart = useCallback(() => {
+    setLoading(true);
+    setError(null);
+  }, [setError, setLoading]);
+
+  const handleCanPlay = useCallback(() => {
+    setLoading(false);
+  }, [setLoading]);
 
   // Track container resize to recompute video bounds
   useEffect(() => {
@@ -132,8 +174,30 @@ export function VideoPreview() {
 
   // Handle video error
   const handleError = useCallback((e: React.SyntheticEvent<HTMLVideoElement>) => {
-    console.error('Video error:', e.currentTarget.error);
-  }, []);
+    const video = e.currentTarget;
+    const mediaError = video.error;
+    const reason = mediaError
+      ? ({
+          1: 'o carregamento foi interrompido',
+          2: 'houve uma falha de rede',
+          3: 'o arquivo não pôde ser decodificado',
+          4: 'o formato ou a URL não são suportados',
+        }[mediaError.code] || `erro de mídia ${mediaError.code}`)
+      : 'erro desconhecido';
+    const message = `Não foi possível carregar o vídeo: ${reason}.`;
+
+    console.error('Video error:', {
+      message,
+      src: video.src,
+      currentSrc: video.currentSrc,
+      readyState: video.readyState,
+      networkState: video.networkState,
+      error: mediaError,
+    });
+    setLoading(false);
+    setError(message);
+    setIsPlaying(false);
+  }, [setError, setIsPlaying, setLoading]);
 
   // Playback controls
   const handlePlayPause = useCallback(() => {
@@ -775,6 +839,21 @@ export function VideoPreview() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [isZoomPicking, stopZoomPicking]);
 
+  const videoUrl = source
+    ? mediaPathToUrl(source.path, source.id, source.filename)
+    : null;
+
+  useEffect(() => {
+    if (videoUrl) {
+      setLoading(true);
+      setError(null);
+    } else if (source) {
+      setLoading(false);
+      setError('Não foi encontrada uma URL válida para o vídeo.');
+      setIsPlaying(false);
+    }
+  }, [setError, setIsPlaying, setLoading, source, videoUrl]);
+
   if (!source || !timeline) {
     return (
       <div className="h-full flex items-center justify-center text-terminal-muted">
@@ -782,10 +861,6 @@ export function VideoPreview() {
       </div>
     );
   }
-
-  // Construct video URL - use ID-based filename, not original filename
-  const ext = source.filename.split('.').pop() || 'mp4';
-  const videoUrl = `/uploads/${source.id}.${ext}`;
 
   return (
     <div className="h-full w-full flex flex-col bg-terminal-bg">
@@ -818,8 +893,10 @@ export function VideoPreview() {
             }}>
               <video
                 ref={videoRef}
-                src={videoUrl}
+                src={videoUrl ?? undefined}
+                onLoadStart={handleLoadStart}
                 onLoadedMetadata={handleLoadedMetadata}
+                onCanPlay={handleCanPlay}
                 onError={handleError}
                 playsInline
                 style={{
@@ -844,6 +921,17 @@ export function VideoPreview() {
               />
             </div>
           </div>
+
+          {(isLoading || videoError) && (
+            <div
+              className="absolute inset-0 flex items-center justify-center p-6 text-center pointer-events-none"
+              style={{ zIndex: 40 }}
+            >
+              <div className={videoError ? 'text-red-300' : 'text-terminal-muted'}>
+                {videoError || 'Carregando vídeo...'}
+              </div>
+            </div>
+          )}
 
           {/* Interactive zoom box - when zoom effect is selected (no zoom transform applied) */}
           {selectedZoomEffect && (() => {
@@ -921,8 +1009,8 @@ export function VideoPreview() {
               ? DEVICE_FRAME_PRESETS.find(f => f.id === overlay.deviceFrameId) || null
               : null;
 
-            const overlayExt = overlaySource.filename.split('.').pop() || 'mp4';
-            const overlayUrl = `/uploads/${overlaySource.id}.${overlayExt}`;
+            const overlayUrl = mediaPathToUrl(overlaySource.path, overlaySource.id, overlaySource.filename);
+            if (!overlayUrl) return null;
 
             return (
               <div
@@ -1019,8 +1107,8 @@ export function VideoPreview() {
       {allAudioSegments.map(audioSeg => {
         const audioSource = project?.audioSources?.find(s => s.id === audioSeg.audioSourceId);
         if (!audioSource) return null;
-        const audioExt = audioSource.filename.split('.').pop() || 'mp3';
-        const audioUrl = `/uploads/${audioSource.id}.${audioExt}`;
+        const audioUrl = mediaPathToUrl(audioSource.path, audioSource.id, audioSource.filename);
+        if (!audioUrl) return null;
         return (
           <audio
             key={audioSeg.id}
